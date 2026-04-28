@@ -1,0 +1,99 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:  # allow manual trigger from GitHub UI
+
+# Restrict GITHUB_TOKEN to read-only
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to ${{ matrix.server.name }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false  # continue deploying to other servers if one fails
+      matrix:
+        server:
+          - name: Alibaba
+            user_secret: ALIBABA_USER
+            ip_secret: ALIBABA_TAILSCALE_IP
+          - name: Tencent
+            user_secret: TENCENT_USER
+            ip_secret: TENCENT_TAILSCALE_IP
+          - name: AWS
+            user_secret: AWS_USER
+            ip_secret: AWS_TAILSCALE_IP
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Connect to Tailscale ────────────────────────────────────────────────
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v2
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          tags: tag:ci
+
+      # ── Verify Tailscale connectivity before attempting SSH ─────────────────
+      - name: Verify Tailscale connectivity
+        run: |
+          SERVER_IP="${{ secrets[matrix.server.ip_secret] }}"
+          echo "Pinging ${{ matrix.server.name }} at $SERVER_IP ..."
+          if ! tailscale ping --c 3 "$SERVER_IP" &>/dev/null; then
+            echo "ERROR: Cannot reach ${{ matrix.server.name }} over Tailscale."
+            exit 1
+          fi
+          echo "✓ ${{ matrix.server.name }} is reachable."
+
+      # ── Deploy via Tailscale SSH ────────────────────────────────────────────
+      - name: Deploy to ${{ matrix.server.name }}
+        run: |
+          ssh \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=15 \
+            ${{ secrets[matrix.server.user_secret] }}@${{ secrets[matrix.server.ip_secret] }} \
+            'bash -s' << 'ENDSSH'
+              set -euo pipefail
+
+              APP_DIR="/opt/myapp"
+
+              echo "── Pulling latest images ──"
+              cd "$APP_DIR"
+              docker compose pull
+
+              echo "── Deploying containers ──"
+              docker compose up -d --remove-orphans
+
+              echo "── Removing unused images ──"
+              docker image prune -f
+
+              echo "── Container status ──"
+              docker compose ps
+          ENDSSH
+
+      # ── Post-deploy health check ────────────────────────────────────────────
+      - name: Health check ${{ matrix.server.name }}
+        run: |
+          ssh \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=15 \
+            ${{ secrets[matrix.server.user_secret] }}@${{ secrets[matrix.server.ip_secret] }} \
+            'bash -s' << 'ENDSSH'
+              set -euo pipefail
+
+              echo "── Running containers ──"
+              RUNNING=$(docker compose -f /opt/myapp/docker-compose.yml ps --status running --quiet | wc -l)
+
+              if [[ "$RUNNING" -eq 0 ]]; then
+                echo "ERROR: No running containers after deploy."
+                docker compose -f /opt/myapp/docker-compose.yml logs --tail=50
+                exit 1
+              fi
+
+              echo "✓ $RUNNING container(s) running."
+          ENDSSH
